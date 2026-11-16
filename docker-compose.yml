@@ -1,0 +1,26 @@
+# PostgreSQL 18 local para Insumap. Copia .env.example a .env antes de usarlo.
+name: insumap-database
+
+services:
+  db:
+    image: postgres:18-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?Define POSTGRES_USER en .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Define POSTGRES_PASSWORD en .env}
+      POSTGRES_DB: ${POSTGRES_DB:?Define POSTGRES_DB en .env}
+    ports:
+      # Solo en loopback: la base local no debe quedar expuesta a la red.
+      - "127.0.0.1:5432:5432"
+    volumes:
+      # PostgreSQL 18 cambió el directorio de datos: montar en /var/lib/postgresql.
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+volumes:
+  pgdata:
