@@ -1,0 +1,46 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [develop, main]
+
+permissions:
+  contents: read
+
+jobs:
+  migrations:
+    name: Migraciones sobre PostgreSQL 18 limpio
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: insumap
+          POSTGRES_PASSWORD: insumap
+          POSTGRES_DB: insumap
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U insumap -d insumap"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      DATABASE_URL_MIGRATOR: postgresql://insumap:insumap@localhost:5432/insumap
+    steps:
+      - name: Descarga el repositorio
+        uses: actions/checkout@v4
+
+      - name: Instala uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Instala dependencias bloqueadas
+        run: uv sync --locked
+
+      - name: Revisa estilo y lint
+        run: uv run ruff check .
+
+      - name: Aplica y revierte las migraciones
+        run: uv run pytest
