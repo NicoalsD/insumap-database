@@ -478,3 +478,98 @@ def populate_care(conn: psycopg.Connection, t: Tenant) -> CareRows:
     )
     assert all(isinstance(value, UUID) for value in ids)
     return CareRows(*ids)  # type: ignore[arg-type]
+
+
+@dataclass(frozen=True)
+class MonitoringRows:
+    """One row per monitoring table of a tenant."""
+
+    batch_id: UUID
+    reading_id: UUID
+    issue_id: UUID
+    insulin_id: UUID
+    meal_id: UUID
+    activity_id: UUID
+    symptom_record_id: UUID
+    lab_id: UUID
+    symptom_id: UUID
+
+
+# Minimal INSERT of each record table; the first two parameters are always
+# (clinic_id, patient_id) and the third is recorded_by.
+RECORD_INSERTS = {
+    "glucose_readings": (
+        "INSERT INTO monitoring.glucose_readings (clinic_id, patient_id,"
+        " recorded_by, client_reading_id, measured_at, value_mg_dl, source)"
+        " VALUES (%s, %s, %s, uuidv7(), now(), 100, 'MANUAL') RETURNING id"
+    ),
+    "insulin_doses": (
+        "INSERT INTO monitoring.insulin_doses (clinic_id, patient_id, recorded_by,"
+        " client_record_id, administered_at, insulin_kind, product_name, units)"
+        " VALUES (%s, %s, %s, uuidv7(), now(), 'BASAL', 'Producto', 5) RETURNING id"
+    ),
+    "meals": (
+        "INSERT INTO monitoring.meals (clinic_id, patient_id, recorded_by,"
+        " client_record_id, eaten_at, meal_type, carbs_g)"
+        " VALUES (%s, %s, %s, uuidv7(), now(), 'LUNCH', 40) RETURNING id"
+    ),
+    "physical_activities": (
+        "INSERT INTO monitoring.physical_activities (clinic_id, patient_id,"
+        " recorded_by, client_record_id, started_at, activity_type, duration_min,"
+        " intensity) VALUES (%s, %s, %s, uuidv7(), now(), 'Caminata', 30, 'LOW')"
+        " RETURNING id"
+    ),
+    "lab_results": (
+        "INSERT INTO monitoring.lab_results (clinic_id, patient_id, recorded_by,"
+        " client_record_id, performed_on, value, unit, value_pct, origin)"
+        " VALUES (%s, %s, %s, uuidv7(), current_date, 7, '%%', 7, 'PATIENT_REPORTED')"
+        " RETURNING id"
+    ),
+}
+
+
+def populate_monitoring(conn: psycopg.Connection, t: Tenant) -> MonitoringRows:
+    """Add a row to every monitoring table of a tenant (as the superuser)."""
+    ids = {
+        table: scalar(conn, sql, (t.clinic_id, t.patient_id, t.patient_user_id))
+        for table, sql in RECORD_INSERTS.items()
+    }
+    batch_id = scalar(
+        conn,
+        "INSERT INTO monitoring.sync_batches (clinic_id, patient_id, source,"
+        " submitted_by, total_items, created_count, duplicate_count, rejected_count)"
+        " VALUES (%s, %s, 'OFFLINE_QUEUE', %s, 1, 1, 0, 0) RETURNING id",
+        (t.clinic_id, t.patient_id, t.patient_user_id),
+    )
+    issue_id = scalar(
+        conn,
+        "INSERT INTO monitoring.reading_issues (clinic_id, reading_id, issue_code)"
+        " VALUES (%s, %s, 'DUPLICATE_SUSPECTED') RETURNING id",
+        (t.clinic_id, ids["glucose_readings"]),
+    )
+    symptom_id = scalar(
+        conn,
+        "INSERT INTO care.symptom_catalog (clinic_id, code, label_es)"
+        " VALUES (%s, 'MON_SYMPTOM', 'Sintoma') RETURNING id",
+        (t.clinic_id,),
+    )
+    symptom_record_id = scalar(
+        conn,
+        "INSERT INTO monitoring.symptoms (clinic_id, patient_id, recorded_by,"
+        " client_record_id, occurred_at, symptom_id)"
+        " VALUES (%s, %s, %s, uuidv7(), now(), %s) RETURNING id",
+        (t.clinic_id, t.patient_id, t.patient_user_id, symptom_id),
+    )
+    values = (
+        batch_id,
+        ids["glucose_readings"],
+        issue_id,
+        ids["insulin_doses"],
+        ids["meals"],
+        ids["physical_activities"],
+        symptom_record_id,
+        ids["lab_results"],
+        symptom_id,
+    )
+    assert all(isinstance(value, UUID) for value in values)
+    return MonitoringRows(*values)  # type: ignore[arg-type]
