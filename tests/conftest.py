@@ -2,6 +2,11 @@
 
 The tests need a clean PostgreSQL 18 database reachable through
 DATABASE_URL_MIGRATOR. When that variable is not set, the tests are skipped.
+
+The URL must use a superuser (the Docker Compose or CI user): fixtures insert
+test rows as that user, which bypasses RLS, and then switch to insumap_app or
+insumap_readonly with SET LOCAL ROLE, which do not. Every data test runs in a
+transaction that is rolled back, so no row survives to block a downgrade.
 """
 
 import os
@@ -45,3 +50,14 @@ def schema_connection(
     command.upgrade(alembic_config, "head")
     with psycopg.connect(migrator_url, autocommit=True) as connection:
         yield connection
+
+
+@pytest.fixture
+def db(alembic_config: Config, migrator_url: str) -> Iterator[psycopg.Connection]:
+    """Yield a connection inside a transaction that is always rolled back."""
+    command.upgrade(alembic_config, "head")
+    with psycopg.connect(migrator_url) as connection:
+        try:
+            yield connection
+        finally:
+            connection.rollback()
