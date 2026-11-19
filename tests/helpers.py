@@ -650,3 +650,121 @@ def populate_alerts(conn: psycopg.Connection, t: Tenant) -> AlertRows:
     )
     assert all(isinstance(value, UUID) for value in values)
     return AlertRows(*values)  # type: ignore[arg-type]
+
+
+@dataclass(frozen=True)
+class AiRows:
+    """One row per ai table of a tenant."""
+
+    forecast_id: UUID
+    risk_id: UUID
+    pattern_id: UUID
+    recommendation_id: UUID
+    decision_id: UUID
+    summary_id: UUID
+    question_id: UUID
+    answer_id: UUID
+    document_id: UUID
+    draft_document_id: UUID
+    evaluation_id: UUID
+
+
+# Columns every AI output carries; the values are dummies.
+AI_OUTPUT_COLUMNS = "model_name, model_version, input_hash, explanation, generated_at"
+AI_OUTPUT_VALUES = "'modelo', '1.0.0+abc', %s, '{}', now()"
+
+
+def populate_ai(conn: psycopg.Connection, t: Tenant, care: CareRows) -> AiRows:
+    """Add a row to every ai table of a tenant (as the superuser)."""
+    key = digest(f"input-{t.clinic_id}")
+    forecast_id = scalar(
+        conn,
+        "INSERT INTO ai.glucose_forecasts (clinic_id, patient_id, mode, points,"
+        f" target_profile_id, {AI_OUTPUT_COLUMNS})"
+        f" VALUES (%s, %s, 'SHORT_TERM', '[]', %s, {AI_OUTPUT_VALUES})"
+        " RETURNING id",
+        (t.clinic_id, t.patient_id, care.profile_id, key),
+    )
+    risk_id = scalar(
+        conn,
+        "INSERT INTO ai.risk_assessments (clinic_id, patient_id, assessment_type,"
+        f" window_days, target_profile_id, {AI_OUTPUT_COLUMNS})"
+        f" VALUES (%s, %s, 'DETERIORATION', 7, %s, {AI_OUTPUT_VALUES}) RETURNING id",
+        (t.clinic_id, t.patient_id, care.profile_id, key),
+    )
+    pattern_id = scalar(
+        conn,
+        "INSERT INTO ai.pattern_findings (clinic_id, patient_id, pattern_type,"
+        f" window_start, window_end, evidence, {AI_OUTPUT_COLUMNS})"
+        " VALUES (%s, %s, 'MISSED_DOSE', now() - interval '1 day', now(), '{}',"
+        f" {AI_OUTPUT_VALUES}) RETURNING id",
+        (t.clinic_id, t.patient_id, key),
+    )
+    recommendation_id = scalar(
+        conn,
+        "INSERT INTO ai.recommendations (clinic_id, patient_id, plan_id, action,"
+        " suggestion, target_profile_id, expires_at,"
+        f" {AI_OUTPUT_COLUMNS})"
+        " VALUES (%s, %s, %s, 'INCREASE', '{}', %s, now() + interval '1 day',"
+        f" {AI_OUTPUT_VALUES}) RETURNING id",
+        (t.clinic_id, t.patient_id, care.plan_id, care.profile_id, key),
+    )
+    decision_id = scalar(
+        conn,
+        "INSERT INTO ai.recommendation_decisions (clinic_id, recommendation_id,"
+        " decision, decided_by, decided_at, model_version)"
+        " VALUES (%s, %s, 'APPROVED', %s, now(), '1.0.0+abc') RETURNING id",
+        (t.clinic_id, recommendation_id, t.doctor_id),
+    )
+    summary_id = scalar(
+        conn,
+        "INSERT INTO ai.clinical_summaries (clinic_id, patient_id, period_start,"
+        f" period_end, sections, requested_by, {AI_OUTPUT_COLUMNS})"
+        " VALUES (%s, %s, now() - interval '14 days', now(), '{}', %s,"
+        f" {AI_OUTPUT_VALUES}) RETURNING id",
+        (t.clinic_id, t.patient_id, t.doctor_id, key),
+    )
+    conversation_id = scalar(conn, "SELECT uuidv7()")
+    question_id = scalar(
+        conn,
+        "INSERT INTO ai.assistant_messages (clinic_id, patient_id, conversation_id,"
+        " sender, content) VALUES (%s, %s, %s, 'PATIENT', 'Pregunta') RETURNING id",
+        (t.clinic_id, t.patient_id, conversation_id),
+    )
+    answer_id = scalar(
+        conn,
+        "INSERT INTO ai.assistant_messages (clinic_id, patient_id, conversation_id,"
+        " sender, content, escalation_level, model_name, model_version, input_hash,"
+        " explanation) VALUES (%s, %s, %s, 'ASSISTANT', 'Respuesta', 'NONE',"
+        " 'modelo', '1.0.0+abc', %s, '{}') RETURNING id",
+        (t.clinic_id, t.patient_id, conversation_id, key),
+    )
+    document_sql = (
+        "INSERT INTO ai.knowledge_documents (clinic_id, title, body, status)"
+        " VALUES (%s, %s, 'Texto', %s) RETURNING id"
+    )
+    document_id = scalar(conn, document_sql, (t.clinic_id, "Aprobado", "APPROVED"))
+    draft_document_id = scalar(conn, document_sql, (t.clinic_id, "Borrador", "DRAFT"))
+    evaluation_id = scalar(
+        conn,
+        "INSERT INTO ai.ai_evaluations (clinic_id, use_case, model_name,"
+        " model_version, baseline_name, cohort_ref, sample_size, model_metrics,"
+        " baseline_metrics) VALUES (%s, 'IA1', 'modelo', '1.0.0+abc', 'base',"
+        " 'cohorte-1', 10, '{}', '{}') RETURNING id",
+        (t.clinic_id,),
+    )
+    values = (
+        forecast_id,
+        risk_id,
+        pattern_id,
+        recommendation_id,
+        decision_id,
+        summary_id,
+        question_id,
+        answer_id,
+        document_id,
+        draft_document_id,
+        evaluation_id,
+    )
+    assert all(isinstance(value, UUID) for value in values)
+    return AiRows(*values)  # type: ignore[arg-type]
