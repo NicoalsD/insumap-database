@@ -6,7 +6,7 @@ variables exactly as the backend unit of work does (set_config(..., true)).
 """
 
 import hashlib
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from uuid import UUID
 
 import psycopg
@@ -217,6 +217,53 @@ def add_staff_rows(
     )
 
 
+def add_clinic_rows(
+    conn: psycopg.Connection, key: str, tenant: "Tenant"
+) -> tuple[UUID, UUID]:
+    """Add one row per remaining clinic table; return the site and assignment."""
+    site_id = scalar(
+        conn,
+        "INSERT INTO clinic.sites (clinic_id, name) VALUES (%s, %s) RETURNING id",
+        (tenant.clinic_id, f"Sede {key}"),
+    )
+    conn.execute(
+        "INSERT INTO clinic.staff_sites (user_id, site_id, clinic_id)"
+        " VALUES (%s, %s, %s)",
+        (tenant.doctor_id, site_id, tenant.clinic_id),
+    )
+    assignment_id = scalar(
+        conn,
+        "INSERT INTO clinic.care_team_assignments (clinic_id, patient_id,"
+        " doctor_user_id, is_primary, assigned_by) VALUES (%s, %s, %s, true, %s)"
+        " RETURNING id",
+        (tenant.clinic_id, tenant.patient_id, tenant.doctor_id, tenant.admin_id),
+    )
+    conn.execute(
+        "INSERT INTO clinic.privacy_requests (clinic_id, patient_id, request_type,"
+        " due_at) VALUES (%s, %s, 'ACCESS', now() + interval '15 days')",
+        (tenant.clinic_id, tenant.patient_id),
+    )
+    batch_id = scalar(
+        conn,
+        "SELECT id FROM clinic.import_batches WHERE clinic_id = %s",
+        (tenant.clinic_id,),
+    )
+    conn.execute(
+        "INSERT INTO clinic.import_rows (clinic_id, batch_id, row_number, status)"
+        " VALUES (%s, %s, 1, 'CREATED')",
+        (tenant.clinic_id, batch_id),
+    )
+    conn.execute(
+        "INSERT INTO clinic.clinic_settings (clinic_id, recommendation_expiry_hours,"
+        " forecast_refresh_minutes, dropout_inactivity_days, kpi_min_cell_size)"
+        " VALUES (%s, 1, 1, 1, 1)",
+        (tenant.clinic_id,),
+    )
+    assert isinstance(site_id, UUID)
+    assert isinstance(assignment_id, UUID)
+    return site_id, assignment_id
+
+
 @dataclass(frozen=True)
 class Tenant:
     """A clinic with one person per role and one patient."""
@@ -228,6 +275,8 @@ class Tenant:
     patient_id: UUID
     notice_id: UUID
     consent_id: UUID
+    site_id: UUID
+    assignment_id: UUID
 
 
 def make_tenant(conn: psycopg.Connection, key: str) -> Tenant:
@@ -243,7 +292,7 @@ def make_tenant(conn: psycopg.Connection, key: str) -> Tenant:
     notice_id = make_notice(conn, clinic_id, admin_id)
     consent_id = make_consent(conn, clinic_id, patient_id, notice_id, patient_user_id)
     add_staff_rows(conn, key, clinic_id, admin_id, doctor_id)
-    return Tenant(
+    base = Tenant(
         clinic_id=clinic_id,
         admin_id=admin_id,
         doctor_id=doctor_id,
@@ -251,4 +300,8 @@ def make_tenant(conn: psycopg.Connection, key: str) -> Tenant:
         patient_id=patient_id,
         notice_id=notice_id,
         consent_id=consent_id,
+        site_id=clinic_id,
+        assignment_id=clinic_id,
     )
+    site_id, assignment_id = add_clinic_rows(conn, key, base)
+    return replace(base, site_id=site_id, assignment_id=assignment_id)

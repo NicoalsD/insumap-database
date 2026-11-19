@@ -30,6 +30,12 @@ RLS_TABLES = (
     "clinic.patients",
     "clinic.privacy_notice_versions",
     "clinic.patient_consents",
+    "clinic.sites",
+    "clinic.staff_sites",
+    "clinic.care_team_assignments",
+    "clinic.privacy_requests",
+    "clinic.import_rows",
+    "clinic.clinic_settings",
 )
 # RLS-4 (Modelo de datos 4.3): located by a 256-bit token before any clinic is
 # known; its clinic_id is informative.
