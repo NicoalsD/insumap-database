@@ -68,7 +68,8 @@ def test_tables_exist_and_trigram_search_is_installed(db: psycopg.Connection) ->
     rows = db.execute(
         "SELECT table_name FROM information_schema.tables WHERE table_schema = 'ai'"
     ).fetchall()
-    assert {name for (name,) in rows} == set(TABLES)
+    # pattern_finding_reviews has its own file: tests/test_pattern_finding_reviews.py
+    assert {name for (name,) in rows} == {*TABLES, "pattern_finding_reviews"}
     assert (
         scalar(db, "SELECT count(*) FROM pg_extension WHERE extname = 'pg_trgm'") == 1
     )
