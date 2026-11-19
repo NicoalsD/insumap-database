@@ -6,7 +6,7 @@ variables exactly as the backend unit of work does (set_config(..., true)).
 """
 
 import hashlib
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from uuid import UUID
 
 import psycopg
@@ -217,6 +217,53 @@ def add_staff_rows(
     )
 
 
+def add_clinic_rows(
+    conn: psycopg.Connection, key: str, tenant: "Tenant"
+) -> tuple[UUID, UUID]:
+    """Add one row per remaining clinic table; return the site and assignment."""
+    site_id = scalar(
+        conn,
+        "INSERT INTO clinic.sites (clinic_id, name) VALUES (%s, %s) RETURNING id",
+        (tenant.clinic_id, f"Sede {key}"),
+    )
+    conn.execute(
+        "INSERT INTO clinic.staff_sites (user_id, site_id, clinic_id)"
+        " VALUES (%s, %s, %s)",
+        (tenant.doctor_id, site_id, tenant.clinic_id),
+    )
+    assignment_id = scalar(
+        conn,
+        "INSERT INTO clinic.care_team_assignments (clinic_id, patient_id,"
+        " doctor_user_id, is_primary, assigned_by) VALUES (%s, %s, %s, true, %s)"
+        " RETURNING id",
+        (tenant.clinic_id, tenant.patient_id, tenant.doctor_id, tenant.admin_id),
+    )
+    conn.execute(
+        "INSERT INTO clinic.privacy_requests (clinic_id, patient_id, request_type,"
+        " due_at) VALUES (%s, %s, 'ACCESS', now() + interval '15 days')",
+        (tenant.clinic_id, tenant.patient_id),
+    )
+    batch_id = scalar(
+        conn,
+        "SELECT id FROM clinic.import_batches WHERE clinic_id = %s",
+        (tenant.clinic_id,),
+    )
+    conn.execute(
+        "INSERT INTO clinic.import_rows (clinic_id, batch_id, row_number, status)"
+        " VALUES (%s, %s, 1, 'CREATED')",
+        (tenant.clinic_id, batch_id),
+    )
+    conn.execute(
+        "INSERT INTO clinic.clinic_settings (clinic_id, recommendation_expiry_hours,"
+        " forecast_refresh_minutes, dropout_inactivity_days, kpi_min_cell_size)"
+        " VALUES (%s, 1, 1, 1, 1)",
+        (tenant.clinic_id,),
+    )
+    assert isinstance(site_id, UUID)
+    assert isinstance(assignment_id, UUID)
+    return site_id, assignment_id
+
+
 @dataclass(frozen=True)
 class Tenant:
     """A clinic with one person per role and one patient."""
@@ -228,6 +275,8 @@ class Tenant:
     patient_id: UUID
     notice_id: UUID
     consent_id: UUID
+    site_id: UUID
+    assignment_id: UUID
 
 
 def make_tenant(conn: psycopg.Connection, key: str) -> Tenant:
@@ -243,7 +292,7 @@ def make_tenant(conn: psycopg.Connection, key: str) -> Tenant:
     notice_id = make_notice(conn, clinic_id, admin_id)
     consent_id = make_consent(conn, clinic_id, patient_id, notice_id, patient_user_id)
     add_staff_rows(conn, key, clinic_id, admin_id, doctor_id)
-    return Tenant(
+    base = Tenant(
         clinic_id=clinic_id,
         admin_id=admin_id,
         doctor_id=doctor_id,
@@ -251,4 +300,503 @@ def make_tenant(conn: psycopg.Connection, key: str) -> Tenant:
         patient_id=patient_id,
         notice_id=notice_id,
         consent_id=consent_id,
+        site_id=clinic_id,
+        assignment_id=clinic_id,
     )
+    site_id, assignment_id = add_clinic_rows(conn, key, base)
+    return replace(base, site_id=site_id, assignment_id=assignment_id)
+
+
+PROFILE_COLUMNS = (
+    "clinic_id, code, label, population, version, status, is_default,"
+    " range_low_mg_dl, range_high_mg_dl, very_low_mg_dl, very_high_mg_dl,"
+    " tir_min_pct, tbr_l1_max_pct, tbr_l2_max_pct, tar_l1_max_pct, tar_l2_max_pct,"
+    " cv_max_pct, min_data_sufficiency_pct, min_days, max_gap_minutes,"
+    " hypo_episode_min_minutes, min_readings_for_cv, min_readings_for_cv_smbg,"
+    " night_start, night_end, source_reference"
+)
+# Dummy values: tests never depend on a clinical meaning.
+PROFILE_VALUES = (
+    "%s, %s, 'Perfil de prueba', 'ADULT', %s, %s, false,"
+    " 10, 20, 5, 30, 50, 10, 5, 40, 10, 40, 60, 7, 15, 10, 50, 20,"
+    " '00:00', '06:00', 'Fuente de prueba'"
+)
+
+
+def make_profile(
+    conn: psycopg.Connection,
+    clinic_id: UUID | None,
+    code: str = "TEST_PROFILE",
+    *,
+    version: int = 1,
+    status: str = "DRAFT",
+) -> UUID:
+    """Insert a target profile (global when clinic_id is None)."""
+    value = scalar(
+        conn,
+        f"INSERT INTO care.target_profiles ({PROFILE_COLUMNS})"
+        f" VALUES ({PROFILE_VALUES}) RETURNING id",
+        (clinic_id, code, version, status),
+    )
+    assert isinstance(value, UUID)
+    return value
+
+
+@dataclass(frozen=True)
+class CareRows:
+    """One row per care table of a tenant."""
+
+    profile_id: UUID
+    template_id: UUID
+    plan_id: UUID
+    item_id: UUID
+    draft_plan_id: UUID
+    snapshot_id: UUID
+    reminder_id: UUID
+    follow_up_id: UUID
+    outreach_id: UUID
+    note_id: UUID
+    review_id: UUID
+    validation_id: UUID
+    symptom_id: UUID
+    metrics_id: UUID
+
+
+def populate_care(conn: psycopg.Connection, t: Tenant) -> CareRows:
+    """Add a row to every care table of a tenant (as the superuser)."""
+    profile_id = make_profile(conn, t.clinic_id, "CLINIC_PROFILE", status="ACTIVE")
+    conn.execute(
+        "INSERT INTO care.patient_target_assignments (clinic_id, patient_id,"
+        " target_profile_id, assigned_by) VALUES (%s, %s, %s, %s)",
+        (t.clinic_id, t.patient_id, profile_id, t.doctor_id),
+    )
+    template_id = scalar(
+        conn,
+        "INSERT INTO care.protocol_templates (clinic_id, code, name, version,"
+        " status, content) VALUES (%s, 'TEMPLATE', 'Plantilla', 1, 'ACTIVE', '{}')"
+        " RETURNING id",
+        (t.clinic_id,),
+    )
+    plan_sql = (
+        "INSERT INTO care.treatment_plans (clinic_id, patient_id, version, status,"
+        " template_id, target_profile_id, created_by)"
+        " VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id"
+    )
+    plan_id = scalar(
+        conn,
+        plan_sql,
+        (t.clinic_id, t.patient_id, 1, "ACTIVE", template_id, profile_id, t.doctor_id),
+    )
+    draft_plan_id = scalar(
+        conn,
+        plan_sql,
+        (t.clinic_id, t.patient_id, 2, "DRAFT", template_id, profile_id, t.doctor_id),
+    )
+    item_id = scalar(
+        conn,
+        "INSERT INTO care.treatment_plan_items (clinic_id, plan_id, item_type, name)"
+        " VALUES (%s, %s, 'MEASURE', 'Medicion') RETURNING id",
+        (t.clinic_id, draft_plan_id),
+    )
+    snapshot_id = scalar(
+        conn,
+        "INSERT INTO care.treatment_plan_snapshots (clinic_id, plan_id, snapshot_no,"
+        " snapshot, taken_by) VALUES (%s, %s, 1, '{}', %s) RETURNING id",
+        (t.clinic_id, plan_id, t.doctor_id),
+    )
+    reminder_id = scalar(
+        conn,
+        "INSERT INTO care.reminder_schedules (clinic_id, patient_id, reminder_type,"
+        " local_time, message_key, set_by)"
+        " VALUES (%s, %s, 'MEASUREMENT', '08:00', 'reminder.measure', %s)"
+        " RETURNING id",
+        (t.clinic_id, t.patient_id, t.doctor_id),
+    )
+    follow_sql = (
+        "INSERT INTO care.follow_ups (clinic_id, patient_id, kind, status, title,"
+        " created_by) VALUES (%s, %s, %s, %s, 'Control', %s) RETURNING id"
+    )
+    follow_up_id = scalar(
+        conn,
+        follow_sql,
+        (t.clinic_id, t.patient_id, "CONTROL", "SCHEDULED", t.doctor_id),
+    )
+    outreach_id = scalar(
+        conn, follow_sql, (t.clinic_id, t.patient_id, "OUTREACH", "OPEN", t.admin_id)
+    )
+    note_id = scalar(
+        conn,
+        "INSERT INTO care.clinical_notes (clinic_id, patient_id, author_user_id, body)"
+        " VALUES (%s, %s, %s, 'Nota') RETURNING id",
+        (t.clinic_id, t.patient_id, t.doctor_id),
+    )
+    review_id = scalar(
+        conn,
+        "INSERT INTO care.triage_reviews (clinic_id, patient_id, reviewed_by,"
+        " window_days) VALUES (%s, %s, %s, 7) RETURNING id",
+        (t.clinic_id, t.patient_id, t.doctor_id),
+    )
+    validation_id = scalar(
+        conn,
+        "INSERT INTO care.reading_validation_settings (clinic_id, version, status,"
+        " min_measurable_mg_dl, max_measurable_mg_dl, future_tolerance_seconds,"
+        " max_reading_age_hours, duplicate_window_seconds, max_rate_mg_dl_per_min,"
+        " unit_mismatch_ratio) VALUES (%s, 1, 'ACTIVE', 10, 900, 60, 48, 120, 9, 5)"
+        " RETURNING id",
+        (t.clinic_id,),
+    )
+    symptom_id = scalar(
+        conn,
+        "INSERT INTO care.symptom_catalog (clinic_id, code, label_es)"
+        " VALUES (%s, 'TEST_SYMPTOM', 'Sintoma') RETURNING id",
+        (t.clinic_id,),
+    )
+    metrics_id = scalar(
+        conn,
+        "INSERT INTO care.glycemic_metric_snapshots (clinic_id, patient_id,"
+        " target_profile_id, window_days, window_start, window_end, signal,"
+        " data_sufficiency_pct, confidence)"
+        " VALUES (%s, %s, %s, 7, now() - interval '7 days', now(), 'CGM', 90, 'OK')"
+        " RETURNING id",
+        (t.clinic_id, t.patient_id, profile_id),
+    )
+    ids = (
+        profile_id,
+        template_id,
+        plan_id,
+        item_id,
+        draft_plan_id,
+        snapshot_id,
+        reminder_id,
+        follow_up_id,
+        outreach_id,
+        note_id,
+        review_id,
+        validation_id,
+        symptom_id,
+        metrics_id,
+    )
+    assert all(isinstance(value, UUID) for value in ids)
+    return CareRows(*ids)  # type: ignore[arg-type]
+
+
+@dataclass(frozen=True)
+class MonitoringRows:
+    """One row per monitoring table of a tenant."""
+
+    batch_id: UUID
+    reading_id: UUID
+    issue_id: UUID
+    insulin_id: UUID
+    meal_id: UUID
+    activity_id: UUID
+    symptom_record_id: UUID
+    lab_id: UUID
+    symptom_id: UUID
+
+
+# Minimal INSERT of each record table; the first two parameters are always
+# (clinic_id, patient_id) and the third is recorded_by.
+RECORD_INSERTS = {
+    "glucose_readings": (
+        "INSERT INTO monitoring.glucose_readings (clinic_id, patient_id,"
+        " recorded_by, client_reading_id, measured_at, value_mg_dl, source)"
+        " VALUES (%s, %s, %s, uuidv7(), now(), 100, 'MANUAL') RETURNING id"
+    ),
+    "insulin_doses": (
+        "INSERT INTO monitoring.insulin_doses (clinic_id, patient_id, recorded_by,"
+        " client_record_id, administered_at, insulin_kind, product_name, units)"
+        " VALUES (%s, %s, %s, uuidv7(), now(), 'BASAL', 'Producto', 5) RETURNING id"
+    ),
+    "meals": (
+        "INSERT INTO monitoring.meals (clinic_id, patient_id, recorded_by,"
+        " client_record_id, eaten_at, meal_type, carbs_g)"
+        " VALUES (%s, %s, %s, uuidv7(), now(), 'LUNCH', 40) RETURNING id"
+    ),
+    "physical_activities": (
+        "INSERT INTO monitoring.physical_activities (clinic_id, patient_id,"
+        " recorded_by, client_record_id, started_at, activity_type, duration_min,"
+        " intensity) VALUES (%s, %s, %s, uuidv7(), now(), 'Caminata', 30, 'LOW')"
+        " RETURNING id"
+    ),
+    "lab_results": (
+        "INSERT INTO monitoring.lab_results (clinic_id, patient_id, recorded_by,"
+        " client_record_id, performed_on, value, unit, value_pct, origin)"
+        " VALUES (%s, %s, %s, uuidv7(), current_date, 7, '%%', 7, 'PATIENT_REPORTED')"
+        " RETURNING id"
+    ),
+}
+
+
+def populate_monitoring(conn: psycopg.Connection, t: Tenant) -> MonitoringRows:
+    """Add a row to every monitoring table of a tenant (as the superuser)."""
+    ids = {
+        table: scalar(conn, sql, (t.clinic_id, t.patient_id, t.patient_user_id))
+        for table, sql in RECORD_INSERTS.items()
+    }
+    batch_id = scalar(
+        conn,
+        "INSERT INTO monitoring.sync_batches (clinic_id, patient_id, source,"
+        " submitted_by, total_items, created_count, duplicate_count, rejected_count)"
+        " VALUES (%s, %s, 'OFFLINE_QUEUE', %s, 1, 1, 0, 0) RETURNING id",
+        (t.clinic_id, t.patient_id, t.patient_user_id),
+    )
+    issue_id = scalar(
+        conn,
+        "INSERT INTO monitoring.reading_issues (clinic_id, reading_id, issue_code)"
+        " VALUES (%s, %s, 'DUPLICATE_SUSPECTED') RETURNING id",
+        (t.clinic_id, ids["glucose_readings"]),
+    )
+    symptom_id = scalar(
+        conn,
+        "INSERT INTO care.symptom_catalog (clinic_id, code, label_es)"
+        " VALUES (%s, 'MON_SYMPTOM', 'Sintoma') RETURNING id",
+        (t.clinic_id,),
+    )
+    symptom_record_id = scalar(
+        conn,
+        "INSERT INTO monitoring.symptoms (clinic_id, patient_id, recorded_by,"
+        " client_record_id, occurred_at, symptom_id)"
+        " VALUES (%s, %s, %s, uuidv7(), now(), %s) RETURNING id",
+        (t.clinic_id, t.patient_id, t.patient_user_id, symptom_id),
+    )
+    values = (
+        batch_id,
+        ids["glucose_readings"],
+        issue_id,
+        ids["insulin_doses"],
+        ids["meals"],
+        ids["physical_activities"],
+        symptom_record_id,
+        ids["lab_results"],
+        symptom_id,
+    )
+    assert all(isinstance(value, UUID) for value in values)
+    return MonitoringRows(*values)  # type: ignore[arg-type]
+
+
+@dataclass(frozen=True)
+class AlertRows:
+    """One row per alerts table of a tenant."""
+
+    rule_id: UUID
+    alert_id: UUID
+    history_id: UUID
+    notification_id: UUID
+    delivery_id: UUID
+    subscription_id: UUID
+
+
+def populate_alerts(conn: psycopg.Connection, t: Tenant) -> AlertRows:
+    """Add a row to every alerts table of a tenant (as the superuser)."""
+    rule_id = scalar(
+        conn,
+        "INSERT INTO alerts.alert_rules (clinic_id, code, name, alert_type, priority,"
+        " definition, escalation, version, status)"
+        " VALUES (%s, 'TEST_RULE', 'Regla', 'HYPOGLYCEMIA', 'HIGH', '{}', '[]', 1,"
+        " 'ACTIVE') RETURNING id",
+        (t.clinic_id,),
+    )
+    alert_id = scalar(
+        conn,
+        "INSERT INTO alerts.alerts (clinic_id, patient_id, rule_id, alert_type,"
+        " priority) VALUES (%s, %s, %s, 'HYPOGLYCEMIA', 'HIGH') RETURNING id",
+        (t.clinic_id, t.patient_id, rule_id),
+    )
+    history_id = scalar(
+        conn,
+        "INSERT INTO alerts.alert_status_history (clinic_id, alert_id, to_status,"
+        " actor_type) VALUES (%s, %s, 'OPEN', 'SYSTEM') RETURNING id",
+        (t.clinic_id, alert_id),
+    )
+    notification_id = scalar(
+        conn,
+        "INSERT INTO alerts.notifications (clinic_id, recipient_user_id,"
+        " notification_type, message_key, alert_id)"
+        " VALUES (%s, %s, 'ALERT', 'alert.new', %s) RETURNING id",
+        (t.clinic_id, t.patient_user_id, alert_id),
+    )
+    delivery_id = scalar(
+        conn,
+        "INSERT INTO alerts.notification_deliveries (clinic_id, notification_id,"
+        " channel) VALUES (%s, %s, 'IN_APP') RETURNING id",
+        (t.clinic_id, notification_id),
+    )
+    subscription_id = scalar(
+        conn,
+        "INSERT INTO alerts.push_subscriptions (clinic_id, user_id, endpoint,"
+        " endpoint_hash, p256dh, auth_ciphertext, key_id)"
+        " VALUES (%s, %s, %s, %s, 'key', 'secret', %s) RETURNING id",
+        (
+            t.clinic_id,
+            t.patient_user_id,
+            f"https://push.example.test/{t.clinic_id}",
+            digest(f"push-{t.clinic_id}"),
+            "0" * 16,
+        ),
+    )
+    conn.execute(
+        "INSERT INTO alerts.notification_preferences (user_id, clinic_id)"
+        " VALUES (%s, %s)",
+        (t.patient_user_id, t.clinic_id),
+    )
+    values = (
+        rule_id,
+        alert_id,
+        history_id,
+        notification_id,
+        delivery_id,
+        subscription_id,
+    )
+    assert all(isinstance(value, UUID) for value in values)
+    return AlertRows(*values)  # type: ignore[arg-type]
+
+
+@dataclass(frozen=True)
+class AiRows:
+    """One row per ai table of a tenant."""
+
+    forecast_id: UUID
+    risk_id: UUID
+    pattern_id: UUID
+    recommendation_id: UUID
+    decision_id: UUID
+    summary_id: UUID
+    question_id: UUID
+    answer_id: UUID
+    document_id: UUID
+    draft_document_id: UUID
+    evaluation_id: UUID
+
+
+# Columns every AI output carries; the values are dummies.
+AI_OUTPUT_COLUMNS = "model_name, model_version, input_hash, explanation, generated_at"
+AI_OUTPUT_VALUES = "'modelo', '1.0.0+abc', %s, '{}', now()"
+
+
+def populate_ai(conn: psycopg.Connection, t: Tenant, care: CareRows) -> AiRows:
+    """Add a row to every ai table of a tenant (as the superuser)."""
+    key = digest(f"input-{t.clinic_id}")
+    forecast_id = scalar(
+        conn,
+        "INSERT INTO ai.glucose_forecasts (clinic_id, patient_id, mode, points,"
+        f" target_profile_id, {AI_OUTPUT_COLUMNS})"
+        f" VALUES (%s, %s, 'SHORT_TERM', '[]', %s, {AI_OUTPUT_VALUES})"
+        " RETURNING id",
+        (t.clinic_id, t.patient_id, care.profile_id, key),
+    )
+    risk_id = scalar(
+        conn,
+        "INSERT INTO ai.risk_assessments (clinic_id, patient_id, assessment_type,"
+        f" window_days, target_profile_id, {AI_OUTPUT_COLUMNS})"
+        f" VALUES (%s, %s, 'DETERIORATION', 7, %s, {AI_OUTPUT_VALUES}) RETURNING id",
+        (t.clinic_id, t.patient_id, care.profile_id, key),
+    )
+    pattern_id = scalar(
+        conn,
+        "INSERT INTO ai.pattern_findings (clinic_id, patient_id, pattern_type,"
+        f" window_start, window_end, evidence, {AI_OUTPUT_COLUMNS})"
+        " VALUES (%s, %s, 'MISSED_DOSE', now() - interval '1 day', now(), '{}',"
+        f" {AI_OUTPUT_VALUES}) RETURNING id",
+        (t.clinic_id, t.patient_id, key),
+    )
+    recommendation_id = scalar(
+        conn,
+        "INSERT INTO ai.recommendations (clinic_id, patient_id, plan_id, action,"
+        " suggestion, target_profile_id, expires_at,"
+        f" {AI_OUTPUT_COLUMNS})"
+        " VALUES (%s, %s, %s, 'INCREASE', '{}', %s, now() + interval '1 day',"
+        f" {AI_OUTPUT_VALUES}) RETURNING id",
+        (t.clinic_id, t.patient_id, care.plan_id, care.profile_id, key),
+    )
+    decision_id = scalar(
+        conn,
+        "INSERT INTO ai.recommendation_decisions (clinic_id, recommendation_id,"
+        " decision, decided_by, decided_at, model_version)"
+        " VALUES (%s, %s, 'APPROVED', %s, now(), '1.0.0+abc') RETURNING id",
+        (t.clinic_id, recommendation_id, t.doctor_id),
+    )
+    summary_id = scalar(
+        conn,
+        "INSERT INTO ai.clinical_summaries (clinic_id, patient_id, period_start,"
+        f" period_end, sections, requested_by, {AI_OUTPUT_COLUMNS})"
+        " VALUES (%s, %s, now() - interval '14 days', now(), '{}', %s,"
+        f" {AI_OUTPUT_VALUES}) RETURNING id",
+        (t.clinic_id, t.patient_id, t.doctor_id, key),
+    )
+    conversation_id = scalar(conn, "SELECT uuidv7()")
+    question_id = scalar(
+        conn,
+        "INSERT INTO ai.assistant_messages (clinic_id, patient_id, conversation_id,"
+        " sender, content) VALUES (%s, %s, %s, 'PATIENT', 'Pregunta') RETURNING id",
+        (t.clinic_id, t.patient_id, conversation_id),
+    )
+    answer_id = scalar(
+        conn,
+        "INSERT INTO ai.assistant_messages (clinic_id, patient_id, conversation_id,"
+        " sender, content, escalation_level, model_name, model_version, input_hash,"
+        " explanation) VALUES (%s, %s, %s, 'ASSISTANT', 'Respuesta', 'NONE',"
+        " 'modelo', '1.0.0+abc', %s, '{}') RETURNING id",
+        (t.clinic_id, t.patient_id, conversation_id, key),
+    )
+    document_sql = (
+        "INSERT INTO ai.knowledge_documents (clinic_id, title, body, status)"
+        " VALUES (%s, %s, 'Texto', %s) RETURNING id"
+    )
+    document_id = scalar(conn, document_sql, (t.clinic_id, "Aprobado", "APPROVED"))
+    draft_document_id = scalar(conn, document_sql, (t.clinic_id, "Borrador", "DRAFT"))
+    evaluation_id = scalar(
+        conn,
+        "INSERT INTO ai.ai_evaluations (clinic_id, use_case, model_name,"
+        " model_version, baseline_name, cohort_ref, sample_size, model_metrics,"
+        " baseline_metrics) VALUES (%s, 'IA1', 'modelo', '1.0.0+abc', 'base',"
+        " 'cohorte-1', 10, '{}', '{}') RETURNING id",
+        (t.clinic_id,),
+    )
+    values = (
+        forecast_id,
+        risk_id,
+        pattern_id,
+        recommendation_id,
+        decision_id,
+        summary_id,
+        question_id,
+        answer_id,
+        document_id,
+        draft_document_id,
+        evaluation_id,
+    )
+    assert all(isinstance(value, UUID) for value in values)
+    return AiRows(*values)  # type: ignore[arg-type]
+
+
+@dataclass(frozen=True)
+class MessagingRows:
+    """One row per messaging table of a tenant."""
+
+    thread_id: UUID
+    message_id: UUID
+
+
+def populate_messaging(conn: psycopg.Connection, t: Tenant) -> MessagingRows:
+    """Add a thread, a message and a read mark to a tenant (as the superuser)."""
+    thread_id = scalar(
+        conn,
+        "INSERT INTO messaging.threads (clinic_id, patient_id, last_message_at)"
+        " VALUES (%s, %s, now()) RETURNING id",
+        (t.clinic_id, t.patient_id),
+    )
+    message_id = scalar(
+        conn,
+        "INSERT INTO messaging.messages (clinic_id, thread_id, sender_user_id,"
+        " sender_role, body) VALUES (%s, %s, %s, 'PATIENT', 'Hola') RETURNING id",
+        (t.clinic_id, thread_id, t.patient_user_id),
+    )
+    conn.execute(
+        "INSERT INTO messaging.thread_reads (thread_id, user_id, clinic_id,"
+        " last_read_at) VALUES (%s, %s, %s, now())",
+        (thread_id, t.patient_user_id, t.clinic_id),
+    )
+    assert isinstance(thread_id, UUID)
+    assert isinstance(message_id, UUID)
+    return MessagingRows(thread_id, message_id)

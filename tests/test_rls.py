@@ -30,6 +30,12 @@ RLS_TABLES = (
     "clinic.patients",
     "clinic.privacy_notice_versions",
     "clinic.patient_consents",
+    "clinic.sites",
+    "clinic.staff_sites",
+    "clinic.care_team_assignments",
+    "clinic.privacy_requests",
+    "clinic.import_rows",
+    "clinic.clinic_settings",
 )
 # RLS-4 (Modelo de datos 4.3): located by a 256-bit token before any clinic is
 # known; its clinic_id is informative.
@@ -48,7 +54,9 @@ def test_every_table_with_clinic_id_forces_rls(db: psycopg.Connection) -> None:
         "SELECT n.nspname || '.' || c.relname, c.relrowsecurity,"
         "       c.relforcerowsecurity"
         "  FROM pg_class AS c JOIN pg_namespace AS n ON n.oid = c.relnamespace"
-        " WHERE c.relkind = 'r' AND n.nspname IN ('iam', 'clinic')"
+        " WHERE c.relkind IN ('r', 'p') AND NOT c.relispartition"
+        "   AND n.nspname IN ('iam', 'clinic', 'care', 'monitoring', 'alerts', 'ai',"
+        "                     'messaging', 'audit')"
         "   AND (EXISTS (SELECT 1 FROM pg_attribute AS a WHERE a.attrelid = c.oid"
         "                 AND a.attname = 'clinic_id' AND NOT a.attisdropped)"
         "        OR c.relname = 'clinics')"
