@@ -59,7 +59,7 @@ EXPECTED_ROWS_PER_TENANT = {
     "target_profiles": 1,
     "protocol_templates": 1,
     "reading_validation_settings": 1,
-    "symptom_catalog": 1,
+    "symptom_catalog": 2,  # its own row and the global LIPOHYPERTROPHY seed
     "patient_target_assignments": 1,
     "treatment_plans": 2,
     "treatment_plan_items": 1,
@@ -179,7 +179,7 @@ def test_templates_are_hidden_from_patients(
     act_as(db, clinic_id=a.clinic_id, user_id=a.patient_user_id, role="PATIENT")
     assert count(db, "care.protocol_templates") == 0
     assert count(db, "care.target_profiles") == 1
-    assert count(db, "care.symptom_catalog") == 1
+    assert count(db, "care.symptom_catalog") == 2  # noqa: PLR2004
 
 
 def test_clinic_admin_writes_only_its_own_catalog_rows(
