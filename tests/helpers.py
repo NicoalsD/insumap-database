@@ -573,3 +573,80 @@ def populate_monitoring(conn: psycopg.Connection, t: Tenant) -> MonitoringRows:
     )
     assert all(isinstance(value, UUID) for value in values)
     return MonitoringRows(*values)  # type: ignore[arg-type]
+
+
+@dataclass(frozen=True)
+class AlertRows:
+    """One row per alerts table of a tenant."""
+
+    rule_id: UUID
+    alert_id: UUID
+    history_id: UUID
+    notification_id: UUID
+    delivery_id: UUID
+    subscription_id: UUID
+
+
+def populate_alerts(conn: psycopg.Connection, t: Tenant) -> AlertRows:
+    """Add a row to every alerts table of a tenant (as the superuser)."""
+    rule_id = scalar(
+        conn,
+        "INSERT INTO alerts.alert_rules (clinic_id, code, name, alert_type, priority,"
+        " definition, escalation, version, status)"
+        " VALUES (%s, 'TEST_RULE', 'Regla', 'HYPOGLYCEMIA', 'HIGH', '{}', '[]', 1,"
+        " 'ACTIVE') RETURNING id",
+        (t.clinic_id,),
+    )
+    alert_id = scalar(
+        conn,
+        "INSERT INTO alerts.alerts (clinic_id, patient_id, rule_id, alert_type,"
+        " priority) VALUES (%s, %s, %s, 'HYPOGLYCEMIA', 'HIGH') RETURNING id",
+        (t.clinic_id, t.patient_id, rule_id),
+    )
+    history_id = scalar(
+        conn,
+        "INSERT INTO alerts.alert_status_history (clinic_id, alert_id, to_status,"
+        " actor_type) VALUES (%s, %s, 'OPEN', 'SYSTEM') RETURNING id",
+        (t.clinic_id, alert_id),
+    )
+    notification_id = scalar(
+        conn,
+        "INSERT INTO alerts.notifications (clinic_id, recipient_user_id,"
+        " notification_type, message_key, alert_id)"
+        " VALUES (%s, %s, 'ALERT', 'alert.new', %s) RETURNING id",
+        (t.clinic_id, t.patient_user_id, alert_id),
+    )
+    delivery_id = scalar(
+        conn,
+        "INSERT INTO alerts.notification_deliveries (clinic_id, notification_id,"
+        " channel) VALUES (%s, %s, 'IN_APP') RETURNING id",
+        (t.clinic_id, notification_id),
+    )
+    subscription_id = scalar(
+        conn,
+        "INSERT INTO alerts.push_subscriptions (clinic_id, user_id, endpoint,"
+        " endpoint_hash, p256dh, auth_ciphertext, key_id)"
+        " VALUES (%s, %s, %s, %s, 'key', 'secret', %s) RETURNING id",
+        (
+            t.clinic_id,
+            t.patient_user_id,
+            f"https://push.example.test/{t.clinic_id}",
+            digest(f"push-{t.clinic_id}"),
+            "0" * 16,
+        ),
+    )
+    conn.execute(
+        "INSERT INTO alerts.notification_preferences (user_id, clinic_id)"
+        " VALUES (%s, %s)",
+        (t.patient_user_id, t.clinic_id),
+    )
+    values = (
+        rule_id,
+        alert_id,
+        history_id,
+        notification_id,
+        delivery_id,
+        subscription_id,
+    )
+    assert all(isinstance(value, UUID) for value in values)
+    return AlertRows(*values)  # type: ignore[arg-type]
