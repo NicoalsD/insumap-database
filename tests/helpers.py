@@ -305,3 +305,176 @@ def make_tenant(conn: psycopg.Connection, key: str) -> Tenant:
     )
     site_id, assignment_id = add_clinic_rows(conn, key, base)
     return replace(base, site_id=site_id, assignment_id=assignment_id)
+
+
+PROFILE_COLUMNS = (
+    "clinic_id, code, label, population, version, status, is_default,"
+    " range_low_mg_dl, range_high_mg_dl, very_low_mg_dl, very_high_mg_dl,"
+    " tir_min_pct, tbr_l1_max_pct, tbr_l2_max_pct, tar_l1_max_pct, tar_l2_max_pct,"
+    " cv_max_pct, min_data_sufficiency_pct, min_days, max_gap_minutes,"
+    " hypo_episode_min_minutes, min_readings_for_cv, min_readings_for_cv_smbg,"
+    " night_start, night_end, source_reference"
+)
+# Dummy values: tests never depend on a clinical meaning.
+PROFILE_VALUES = (
+    "%s, %s, 'Perfil de prueba', 'ADULT', %s, %s, false,"
+    " 10, 20, 5, 30, 50, 10, 5, 40, 10, 40, 60, 7, 15, 10, 50, 20,"
+    " '00:00', '06:00', 'Fuente de prueba'"
+)
+
+
+def make_profile(
+    conn: psycopg.Connection,
+    clinic_id: UUID | None,
+    code: str = "TEST_PROFILE",
+    *,
+    version: int = 1,
+    status: str = "DRAFT",
+) -> UUID:
+    """Insert a target profile (global when clinic_id is None)."""
+    value = scalar(
+        conn,
+        f"INSERT INTO care.target_profiles ({PROFILE_COLUMNS})"
+        f" VALUES ({PROFILE_VALUES}) RETURNING id",
+        (clinic_id, code, version, status),
+    )
+    assert isinstance(value, UUID)
+    return value
+
+
+@dataclass(frozen=True)
+class CareRows:
+    """One row per care table of a tenant."""
+
+    profile_id: UUID
+    template_id: UUID
+    plan_id: UUID
+    item_id: UUID
+    draft_plan_id: UUID
+    snapshot_id: UUID
+    reminder_id: UUID
+    follow_up_id: UUID
+    outreach_id: UUID
+    note_id: UUID
+    review_id: UUID
+    validation_id: UUID
+    symptom_id: UUID
+    metrics_id: UUID
+
+
+def populate_care(conn: psycopg.Connection, t: Tenant) -> CareRows:
+    """Add a row to every care table of a tenant (as the superuser)."""
+    profile_id = make_profile(conn, t.clinic_id, "CLINIC_PROFILE", status="ACTIVE")
+    conn.execute(
+        "INSERT INTO care.patient_target_assignments (clinic_id, patient_id,"
+        " target_profile_id, assigned_by) VALUES (%s, %s, %s, %s)",
+        (t.clinic_id, t.patient_id, profile_id, t.doctor_id),
+    )
+    template_id = scalar(
+        conn,
+        "INSERT INTO care.protocol_templates (clinic_id, code, name, version,"
+        " status, content) VALUES (%s, 'TEMPLATE', 'Plantilla', 1, 'ACTIVE', '{}')"
+        " RETURNING id",
+        (t.clinic_id,),
+    )
+    plan_sql = (
+        "INSERT INTO care.treatment_plans (clinic_id, patient_id, version, status,"
+        " template_id, target_profile_id, created_by)"
+        " VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id"
+    )
+    plan_id = scalar(
+        conn,
+        plan_sql,
+        (t.clinic_id, t.patient_id, 1, "ACTIVE", template_id, profile_id, t.doctor_id),
+    )
+    draft_plan_id = scalar(
+        conn,
+        plan_sql,
+        (t.clinic_id, t.patient_id, 2, "DRAFT", template_id, profile_id, t.doctor_id),
+    )
+    item_id = scalar(
+        conn,
+        "INSERT INTO care.treatment_plan_items (clinic_id, plan_id, item_type, name)"
+        " VALUES (%s, %s, 'MEASURE', 'Medicion') RETURNING id",
+        (t.clinic_id, draft_plan_id),
+    )
+    snapshot_id = scalar(
+        conn,
+        "INSERT INTO care.treatment_plan_snapshots (clinic_id, plan_id, snapshot_no,"
+        " snapshot, taken_by) VALUES (%s, %s, 1, '{}', %s) RETURNING id",
+        (t.clinic_id, plan_id, t.doctor_id),
+    )
+    reminder_id = scalar(
+        conn,
+        "INSERT INTO care.reminder_schedules (clinic_id, patient_id, reminder_type,"
+        " local_time, message_key, set_by)"
+        " VALUES (%s, %s, 'MEASUREMENT', '08:00', 'reminder.measure', %s)"
+        " RETURNING id",
+        (t.clinic_id, t.patient_id, t.doctor_id),
+    )
+    follow_sql = (
+        "INSERT INTO care.follow_ups (clinic_id, patient_id, kind, status, title,"
+        " created_by) VALUES (%s, %s, %s, %s, 'Control', %s) RETURNING id"
+    )
+    follow_up_id = scalar(
+        conn,
+        follow_sql,
+        (t.clinic_id, t.patient_id, "CONTROL", "SCHEDULED", t.doctor_id),
+    )
+    outreach_id = scalar(
+        conn, follow_sql, (t.clinic_id, t.patient_id, "OUTREACH", "OPEN", t.admin_id)
+    )
+    note_id = scalar(
+        conn,
+        "INSERT INTO care.clinical_notes (clinic_id, patient_id, author_user_id, body)"
+        " VALUES (%s, %s, %s, 'Nota') RETURNING id",
+        (t.clinic_id, t.patient_id, t.doctor_id),
+    )
+    review_id = scalar(
+        conn,
+        "INSERT INTO care.triage_reviews (clinic_id, patient_id, reviewed_by,"
+        " window_days) VALUES (%s, %s, %s, 7) RETURNING id",
+        (t.clinic_id, t.patient_id, t.doctor_id),
+    )
+    validation_id = scalar(
+        conn,
+        "INSERT INTO care.reading_validation_settings (clinic_id, version, status,"
+        " min_measurable_mg_dl, max_measurable_mg_dl, future_tolerance_seconds,"
+        " max_reading_age_hours, duplicate_window_seconds, max_rate_mg_dl_per_min,"
+        " unit_mismatch_ratio) VALUES (%s, 1, 'ACTIVE', 10, 900, 60, 48, 120, 9, 5)"
+        " RETURNING id",
+        (t.clinic_id,),
+    )
+    symptom_id = scalar(
+        conn,
+        "INSERT INTO care.symptom_catalog (clinic_id, code, label_es)"
+        " VALUES (%s, 'TEST_SYMPTOM', 'Sintoma') RETURNING id",
+        (t.clinic_id,),
+    )
+    metrics_id = scalar(
+        conn,
+        "INSERT INTO care.glycemic_metric_snapshots (clinic_id, patient_id,"
+        " target_profile_id, window_days, window_start, window_end, signal,"
+        " data_sufficiency_pct, confidence)"
+        " VALUES (%s, %s, %s, 7, now() - interval '7 days', now(), 'CGM', 90, 'OK')"
+        " RETURNING id",
+        (t.clinic_id, t.patient_id, profile_id),
+    )
+    ids = (
+        profile_id,
+        template_id,
+        plan_id,
+        item_id,
+        draft_plan_id,
+        snapshot_id,
+        reminder_id,
+        follow_up_id,
+        outreach_id,
+        note_id,
+        review_id,
+        validation_id,
+        symptom_id,
+        metrics_id,
+    )
+    assert all(isinstance(value, UUID) for value in ids)
+    return CareRows(*ids)  # type: ignore[arg-type]
