@@ -768,3 +768,35 @@ def populate_ai(conn: psycopg.Connection, t: Tenant, care: CareRows) -> AiRows:
     )
     assert all(isinstance(value, UUID) for value in values)
     return AiRows(*values)  # type: ignore[arg-type]
+
+
+@dataclass(frozen=True)
+class MessagingRows:
+    """One row per messaging table of a tenant."""
+
+    thread_id: UUID
+    message_id: UUID
+
+
+def populate_messaging(conn: psycopg.Connection, t: Tenant) -> MessagingRows:
+    """Add a thread, a message and a read mark to a tenant (as the superuser)."""
+    thread_id = scalar(
+        conn,
+        "INSERT INTO messaging.threads (clinic_id, patient_id, last_message_at)"
+        " VALUES (%s, %s, now()) RETURNING id",
+        (t.clinic_id, t.patient_id),
+    )
+    message_id = scalar(
+        conn,
+        "INSERT INTO messaging.messages (clinic_id, thread_id, sender_user_id,"
+        " sender_role, body) VALUES (%s, %s, %s, 'PATIENT', 'Hola') RETURNING id",
+        (t.clinic_id, thread_id, t.patient_user_id),
+    )
+    conn.execute(
+        "INSERT INTO messaging.thread_reads (thread_id, user_id, clinic_id,"
+        " last_read_at) VALUES (%s, %s, %s, now())",
+        (thread_id, t.patient_user_id, t.clinic_id),
+    )
+    assert isinstance(thread_id, UUID)
+    assert isinstance(message_id, UUID)
+    return MessagingRows(thread_id, message_id)
