@@ -13,6 +13,17 @@ import psycopg
 
 APP_ROLE = "insumap_app"
 READONLY_ROLE = "insumap_readonly"
+# The injection site catalog (SiteCode of the API); right and left are the patient's.
+INJECTION_SITES = (
+    "ABDOMEN_RIGHT",
+    "ABDOMEN_LEFT",
+    "THIGH_RIGHT",
+    "THIGH_LEFT",
+    "ARM_RIGHT",
+    "ARM_LEFT",
+    "BUTTOCK_RIGHT",
+    "BUTTOCK_LEFT",
+)
 
 
 def digest(value: str) -> str:
